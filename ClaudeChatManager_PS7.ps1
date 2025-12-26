@@ -1,11 +1,11 @@
-﻿using namespace System.ComponentModel
+using namespace System.ComponentModel
 using namespace System.Collections.ObjectModel
 
 #requires -Version 7.0
 
 <#
 .SYNOPSIS
-    Claude Chat Manager v3 - WebView2
+    Claude Chat Manager v3 - WebView2 
 .DESCRIPTION
     Manage Claude.ai conversations
 .NOTES
@@ -122,19 +122,27 @@ $script:app_state = @{
     has_loaded_once = $false
     webview2_ready  = $false
     is_busy         = $false
+    deleted_buffer  = @()    # Recently deleted items for undo
 }
 
 $script:ui_cache = @{
-    collection_view = $null
-    match_column    = $null
-    header_checkbox = $null
-    current_search  = ""
+    collection_view      = $null
+    match_column         = $null
+    header_checkbox      = $null
+    current_search       = ""
+    current_search_mode  = $null
+    sidebar_width        = 180
+    sidebar_collapsed    = $false
 }
 
 $script:ui_state = @{
     showing_selected_only = $false
     sort_column           = "Updated"
     sort_direction        = "Descending"
+}
+
+$script:window_state = @{
+    file = Join-Path $script:config.path "window_state.json"
 }
 
 #endregion
@@ -987,7 +995,7 @@ function Get-SearchMode
     .SYNOPSIS
         Parses search text to determine search mode and extract pattern
     .OUTPUTS
-        Hashtable with Mode, Pattern, Terms (for OR), Ids (for ID search)
+        Hashtable with Mode, Pattern, Terms (for OR), Ids (for ID search), Exclusions
     #>
     param([string]$SearchText)
     
@@ -995,22 +1003,50 @@ function Get-SearchMode
     
     if (-not $search_text)
     {
-        return @{ Mode = 'None' }
+        return @{ Mode = 'None'; Exclusions = @() }
+    }
+    
+    # Extract exclusions first: not:word or not:word1,word2,word3
+    $exclusions = @()
+    $remaining_text = $search_text
+    
+    # Find all not: patterns
+    $not_matches = [regex]::Matches($search_text, 'not:([^\s]+)')
+    foreach ($match in $not_matches)
+    {
+        $exclude_part = $match.Groups[1].Value
+        # Split by comma for multiple exclusions in one not:
+        $exclude_terms = @($exclude_part -split ',' | Where-Object { $_ } | ForEach-Object { $_.Trim().ToLowerInvariant() })
+        $exclusions += $exclude_terms
+        # Remove from search text
+        $remaining_text = $remaining_text.Replace($match.Value, '')
+    }
+    
+    $remaining_text = $remaining_text.Trim()
+    
+    # If only exclusions were provided, match everything except exclusions
+    if (-not $remaining_text)
+    {
+        return @{
+            Mode       = 'All'
+            Exclusions = $exclusions
+        }
     }
     
     # ID search: id:value or ids:val1,val2,val3
-    if ($search_text -match '^ids?:(.+)$')
+    if ($remaining_text -match '^ids?:(.+)$')
     {
         $id_part = $Matches[1].Trim()
         $ids = @($id_part -split '[,\s]+' | Where-Object { $_ } | ForEach-Object { $_.Trim() })
         return @{
-            Mode = 'Id'
-            Ids  = $ids
+            Mode       = 'Id'
+            Ids        = $ids
+            Exclusions = $exclusions
         }
     }
     
     # Regex search: /pattern/
-    if ($search_text -match '^/(.+)/$')
+    if ($remaining_text -match '^/(.+)/$')
     {
         $pattern = $Matches[1]
         try
@@ -1018,37 +1054,41 @@ function Get-SearchMode
             # Validate regex
             [void][regex]::new($pattern, 'IgnoreCase')
             return @{
-                Mode    = 'Regex'
-                Pattern = $pattern
+                Mode       = 'Regex'
+                Pattern    = $pattern
+                Exclusions = $exclusions
             }
         }
         catch
         {
             # Invalid regex, fall back to literal
             return @{
-                Mode    = 'Contains'
-                Pattern = $search_text.ToLowerInvariant()
+                Mode       = 'Contains'
+                Pattern    = $remaining_text.ToLowerInvariant()
+                Exclusions = $exclusions
             }
         }
     }
     
     # OR search: term1|term2|term3
-    if ($search_text.Contains('|'))
+    if ($remaining_text.Contains('|'))
     {
-        $terms = @($search_text -split '\|' | Where-Object { $_ } | ForEach-Object { $_.Trim().ToLowerInvariant() })
+        $terms = @($remaining_text -split '\|' | Where-Object { $_ } | ForEach-Object { $_.Trim().ToLowerInvariant() })
         if ($terms.Count -gt 1)
         {
             return @{
-                Mode  = 'Or'
-                Terms = $terms
+                Mode       = 'Or'
+                Terms      = $terms
+                Exclusions = $exclusions
             }
         }
     }
     
     # Default: substring contains
     return @{
-        Mode    = 'Contains'
-        Pattern = $search_text.ToLowerInvariant()
+        Mode       = 'Contains'
+        Pattern    = $remaining_text.ToLowerInvariant()
+        Exclusions = $exclusions
     }
 }
 
@@ -1056,7 +1096,7 @@ function Test-SearchMatch
 {
     <#
     .SYNOPSIS
-        Tests if text matches the search criteria
+        Tests if text matches the search criteria (including exclusions)
     .OUTPUTS
         Boolean indicating match
     #>
@@ -1066,9 +1106,27 @@ function Test-SearchMatch
         [hashtable]$SearchMode
     )
     
+    # Check exclusions first - if any exclusion matches, return false
+    if ($SearchMode.Exclusions -and $SearchMode.Exclusions.Count -gt 0)
+    {
+        foreach ($exclusion in $SearchMode.Exclusions)
+        {
+            if ($TextLower.Contains($exclusion))
+            {
+                return $false
+            }
+        }
+    }
+    
+    # Now check positive matches
     switch ($SearchMode.Mode)
     {
         'None' { return $true }
+        
+        'All' {
+            # Match everything (used when only exclusions are specified)
+            return $true
+        }
         
         'Contains' {
             return $TextLower.Contains($SearchMode.Pattern)
@@ -1150,6 +1208,163 @@ function Get-SearchMatchSnippet
         }
         
         default { return "" }
+    }
+}
+
+function Save-WindowState
+{
+    <#
+    .SYNOPSIS
+        Saves window position, size, and sidebar state to config file
+    #>
+    param([System.Windows.Window]$Window)
+    
+    try
+    {
+        $state = @{
+            Left             = $Window.Left
+            Top              = $Window.Top
+            Width            = $Window.Width
+            Height           = $Window.Height
+            Maximized        = ($Window.WindowState -eq 'Maximized')
+            SidebarCollapsed = $script:ui_cache.sidebar_collapsed
+        }
+        
+        $state | ConvertTo-Json | Set-Content -Path $script:window_state.file -Encoding UTF8
+    }
+    catch
+    {
+        Write-Host "Failed to save window state: $_" -ForegroundColor Yellow
+    }
+}
+
+function Restore-WindowState
+{
+    <#
+    .SYNOPSIS
+        Restores window position, size, and sidebar state from config file
+    #>
+    param([System.Windows.Window]$Window)
+    
+    if (-not (Test-Path $script:window_state.file))
+    {
+        return $false
+    }
+    
+    try
+    {
+        $state = Get-Content -Path $script:window_state.file -Raw | ConvertFrom-Json
+        
+        # Validate that position is on a visible screen
+        $screens = [System.Windows.Forms.Screen]::AllScreens
+        $on_screen = $false
+        
+        foreach ($screen in $screens)
+        {
+            if ($state.Left -ge $screen.Bounds.Left -and 
+                $state.Left -lt $screen.Bounds.Right -and
+                $state.Top -ge $screen.Bounds.Top -and 
+                $state.Top -lt $screen.Bounds.Bottom)
+            {
+                $on_screen = $true
+                break
+            }
+        }
+        
+        if ($on_screen)
+        {
+            $Window.Left   = $state.Left
+            $Window.Top    = $state.Top
+            $Window.Width  = $state.Width
+            $Window.Height = $state.Height
+            
+            if ($state.Maximized)
+            {
+                $Window.WindowState = 'Maximized'
+            }
+        }
+        
+        $script:ui_cache.sidebar_collapsed = $state.SidebarCollapsed -eq $true
+        
+        return $true
+    }
+    catch
+    {
+        Write-Host "Failed to restore window state: $_" -ForegroundColor Yellow
+        return $false
+    }
+}
+
+function Update-StatsDisplay
+{
+    <#
+    .SYNOPSIS
+        Updates the statistics panel with chat data
+    #>
+    
+    $chats = $script:app_state.all_chats
+    
+    if (-not $chats -or $chats.Count -eq 0)
+    {
+        $script:ui['StatsSummary'].Text = "Load chats to see stats"
+        return
+    }
+    
+    # Group by month
+    $by_month = @{}
+    
+    foreach ($chat in $chats)
+    {
+        $month_key = $chat.Updated.ToString("yyyy-MM")
+        
+        if (-not $by_month.ContainsKey($month_key))
+        {
+            $by_month[$month_key] = 0
+        }
+        $by_month[$month_key]++
+    }
+    
+    # Sort by date descending, take last 6 months
+    $sorted = $by_month.GetEnumerator() | Sort-Object Name -Descending | Select-Object -First 6
+    
+    # Build text-based bar chart
+    $max_count = ($sorted | ForEach-Object { $_.Value } | Measure-Object -Maximum).Maximum
+    if ($max_count -eq 0) { $max_count = 1 }
+    
+    $lines = @("$($chats.Count) total conversations`n")
+    
+    foreach ($item in $sorted)
+    {
+        $bar_length = [Math]::Round(($item.Value / $max_count) * 10)
+        $bar        = "█" * $bar_length
+        $month_name = [datetime]::ParseExact($item.Name, "yyyy-MM", $null).ToString("MMM yy")
+        $lines     += "$month_name  $bar $($item.Value)"
+    }
+    
+    $script:ui['StatsSummary'].Text = $lines -join "`n"
+}
+
+function Update-DeletedBufferUI
+{
+    <#
+    .SYNOPSIS
+        Updates the recently deleted UI based on buffer state
+    #>
+    
+    $count = $script:app_state.deleted_buffer.Count
+    
+    if ($count -gt 0)
+    {
+        $script:ui['RecentlyDeletedLabel'].Text       = "RECENTLY DELETED ($count)"
+        $script:ui['RecentlyDeletedLabel'].Visibility = 'Visible'
+        $script:ui['UndoDeleteBtn'].Visibility        = 'Visible'
+        $script:ui['ClearDeletedBtn'].Visibility      = 'Visible'
+    }
+    else
+    {
+        $script:ui['RecentlyDeletedLabel'].Visibility = 'Collapsed'
+        $script:ui['UndoDeleteBtn'].Visibility        = 'Collapsed'
+        $script:ui['ClearDeletedBtn'].Visibility      = 'Collapsed'
     }
 }
 
@@ -2173,6 +2388,9 @@ $script:main_xaml = @'
         MinHeight="400" MinWidth="600"
         WindowStartupLocation="CenterScreen"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent">
+    <WindowChrome.WindowChrome>
+        <WindowChrome CaptionHeight="44" ResizeBorderThickness="6" GlassFrameThickness="0" CornerRadius="8"/>
+    </WindowChrome.WindowChrome>
     <Window.Resources>
         <!-- Dark Tooltip Style -->
         <Style TargetType="ToolTip">
@@ -2415,9 +2633,48 @@ $script:main_xaml = @'
                 </Setter.Value>
             </Setter>
         </Style>
+        
+        <!-- Dark Calendar Styles for DatePicker -->
+        <Style TargetType="Calendar">
+            <Setter Property="Background" Value="#1a1a1a"/>
+            <Setter Property="Foreground" Value="#aaa"/>
+            <Setter Property="BorderBrush" Value="#333"/>
+        </Style>
+        <Style TargetType="CalendarDayButton">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="#aaa"/>
+            <Style.Triggers>
+                <Trigger Property="IsToday" Value="True">
+                    <Setter Property="Background" Value="#2a4a6a"/>
+                </Trigger>
+                <Trigger Property="IsSelected" Value="True">
+                    <Setter Property="Background" Value="#3498db"/>
+                    <Setter Property="Foreground" Value="White"/>
+                </Trigger>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#333"/>
+                </Trigger>
+                <Trigger Property="IsBlackedOut" Value="True">
+                    <Setter Property="Foreground" Value="#444"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style TargetType="CalendarButton">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="#aaa"/>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#333"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style TargetType="CalendarItem">
+            <Setter Property="Background" Value="#1a1a1a"/>
+            <Setter Property="Foreground" Value="#aaa"/>
+        </Style>
     </Window.Resources>
     
-    <Border Background="#111" CornerRadius="8" BorderBrush="#2a2a2a" BorderThickness="1">
+    <Border Background="#111" CornerRadius="8" BorderBrush="#2a2a2a" BorderThickness="1" ClipToBounds="True">
         <Grid>
             <Grid.RowDefinitions>
                 <RowDefinition Height="44"/>
@@ -2428,9 +2685,39 @@ $script:main_xaml = @'
             <!-- Title Bar -->
             <Border x:Name="TitleBar" Background="#161616" CornerRadius="8,8,0,0">
                 <Grid>
-                    <StackPanel Orientation="Horizontal" Margin="16,0">
+                    <StackPanel Orientation="Horizontal" Margin="8,0,16,0">
+                        <Button x:Name="HamburgerBtn" Width="32" Height="32" Background="Transparent" BorderThickness="0" 
+                                Cursor="Hand" ToolTip="Toggle sidebar (Ctrl+B)" VerticalAlignment="Center"
+                                WindowChrome.IsHitTestVisibleInChrome="True">
+                            <Button.Template>
+                                <ControlTemplate TargetType="Button">
+                                    <Border x:Name="border" Background="Transparent" CornerRadius="4" Padding="6">
+                                        <Grid x:Name="IconGrid" RenderTransformOrigin="0.5,0.5">
+                                            <Grid.RenderTransform>
+                                                <RotateTransform x:Name="IconRotation" Angle="0"/>
+                                            </Grid.RenderTransform>
+                                            <!-- Hamburger lines (visible when expanded) -->
+                                            <StackPanel x:Name="HamburgerLines" VerticalAlignment="Center" Opacity="1">
+                                                <Border Height="2" Width="16" Background="#666" Margin="0,1.5"/>
+                                                <Border Height="2" Width="16" Background="#666" Margin="0,1.5"/>
+                                                <Border Height="2" Width="16" Background="#666" Margin="0,1.5"/>
+                                            </StackPanel>
+                                            <!-- Arrow (visible when collapsed) -->
+                                            <TextBlock x:Name="ArrowIcon" Text="»" FontSize="16" Foreground="#666" 
+                                                       HorizontalAlignment="Center" VerticalAlignment="Center" 
+                                                       Opacity="0" FontWeight="Bold"/>
+                                        </Grid>
+                                    </Border>
+                                    <ControlTemplate.Triggers>
+                                        <Trigger Property="IsMouseOver" Value="True">
+                                            <Setter TargetName="border" Property="Background" Value="#252525"/>
+                                        </Trigger>
+                                    </ControlTemplate.Triggers>
+                                </ControlTemplate>
+                            </Button.Template>
+                        </Button>
                         <TextBlock Text="Claude Chat Manager" VerticalAlignment="Center" Foreground="#ccc" 
-                                   FontSize="12" FontWeight="Medium"/>
+                                   FontSize="12" FontWeight="Medium" Margin="8,0,0,0"/>
                         <Border CornerRadius="10" Padding="8,3" Margin="16,0" VerticalAlignment="Center" Background="#1a1a1a">
                             <StackPanel Orientation="Horizontal">
                                 <Ellipse x:Name="StatusDot" Width="6" Height="6" Fill="#555" Margin="0,0,6,0"/>
@@ -2439,50 +2726,109 @@ $script:main_xaml = @'
                         </Border>
                     </StackPanel>
                     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-                        <Button x:Name="MinBtn" Content="&#xE921;" Style="{StaticResource WindowControlBtn}"/>
-                        <Button x:Name="MaxBtn" Content="&#xE922;" Style="{StaticResource WindowControlBtn}"/>
-                        <Button x:Name="CloseBtn" Content="&#xE8BB;" Style="{StaticResource CloseControlBtn}"/>
+                        <Button x:Name="MinBtn" Content="&#xE921;" Style="{StaticResource WindowControlBtn}" WindowChrome.IsHitTestVisibleInChrome="True"/>
+                        <Button x:Name="MaxBtn" Content="&#xE922;" Style="{StaticResource WindowControlBtn}" WindowChrome.IsHitTestVisibleInChrome="True"/>
+                        <Button x:Name="CloseBtn" Content="&#xE8BB;" Style="{StaticResource CloseControlBtn}" WindowChrome.IsHitTestVisibleInChrome="True"/>
                     </StackPanel>
                 </Grid>
             </Border>
             
             <!-- Content -->
-            <Grid Grid.Row="1" Margin="16,12,16,12">
+            <Grid Grid.Row="1" Margin="16,12,16,12" ClipToBounds="True">
                 <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="180"/>
+                    <ColumnDefinition x:Name="SidebarColumn" Width="180"/>
                     <ColumnDefinition Width="16"/>
                     <ColumnDefinition Width="*"/>
                 </Grid.ColumnDefinitions>
                 
-                <!-- Sidebar -->
-                <StackPanel>
-                    <Button x:Name="LoginBtn" Content="Login" Style="{StaticResource SidebarButton}" Margin="0,0,0,6"/>
-                    <Button x:Name="LoadBtn" Content="Load Chats" Style="{StaticResource SidebarButton}" Margin="0,0,0,20" IsEnabled="False"/>
+                <!-- Sidebar with ScrollViewer -->
+                <ScrollViewer x:Name="SidebarScroller" VerticalScrollBarVisibility="Auto" 
+                              HorizontalScrollBarVisibility="Disabled"
+                              PanningMode="VerticalOnly">
+                    <ScrollViewer.Resources>
+                        <Style TargetType="ScrollBar">
+                            <Setter Property="Width" Value="6"/>
+                            <Setter Property="Background" Value="Transparent"/>
+                            <Setter Property="Template">
+                                <Setter.Value>
+                                    <ControlTemplate TargetType="ScrollBar">
+                                        <Track x:Name="PART_Track" IsDirectionReversed="true">
+                                            <Track.Thumb>
+                                                <Thumb>
+                                                    <Thumb.Template>
+                                                        <ControlTemplate TargetType="Thumb">
+                                                            <Border Background="#3a3a3a" CornerRadius="3" Margin="1,0"/>
+                                                        </ControlTemplate>
+                                                    </Thumb.Template>
+                                                </Thumb>
+                                            </Track.Thumb>
+                                        </Track>
+                                    </ControlTemplate>
+                                </Setter.Value>
+                            </Setter>
+                        </Style>
+                    </ScrollViewer.Resources>
+                    <StackPanel x:Name="SidebarPanel">
+                        <Button x:Name="LoginBtn" Content="Login" Style="{StaticResource SidebarButton}" Margin="0,0,0,6"/>
+                        <Button x:Name="LoadBtn" Content="Load Chats" Style="{StaticResource SidebarButton}" Margin="0,0,0,20" IsEnabled="False"/>
                     
                     <TextBlock Foreground="#444" FontSize="9" FontWeight="SemiBold" Margin="0,0,0,6">
                         <Run Text="FILTER"/><Run Text="  Ctrl+F" Foreground="#333" FontWeight="Normal"/>
                     </TextBlock>
-                    <TextBox x:Name="SearchBox" Height="30" Background="#1a1a1a" Foreground="#aaa" 
-                             BorderBrush="#2a2a2a" BorderThickness="1" Padding="8,0" FontSize="11" 
-                             VerticalContentAlignment="Center" CaretBrush="#666">
-                        <TextBox.ToolTip>
-                            <ToolTip MaxWidth="300" Padding="10,8">
-                                <StackPanel>
-                                    <TextBlock Text="Search Syntax" FontWeight="SemiBold" Foreground="#aaa" Margin="0,0,0,6"/>
-                                    <TextBlock Text="text" Foreground="#3498db" FontFamily="Consolas"/>
-                                    <TextBlock Text="  Substring match" Foreground="#888" Margin="0,0,0,4"/>
-                                    <TextBlock Text="foo|bar|baz" Foreground="#3498db" FontFamily="Consolas"/>
-                                    <TextBlock Text="  OR search (any term)" Foreground="#888" Margin="0,0,0,4"/>
-                                    <TextBlock Text="/regex pattern/" Foreground="#3498db" FontFamily="Consolas"/>
-                                    <TextBlock Text="  Regular expression" Foreground="#888" Margin="0,0,0,4"/>
-                                    <TextBlock Text="id:abc123" Foreground="#3498db" FontFamily="Consolas"/>
-                                    <TextBlock Text="  Search by ID" Foreground="#888" Margin="0,0,0,4"/>
-                                    <TextBlock Text="ids:abc,def,ghi" Foreground="#3498db" FontFamily="Consolas"/>
-                                    <TextBlock Text="  Multiple IDs (comma-sep)" Foreground="#888"/>
-                                </StackPanel>
-                            </ToolTip>
-                        </TextBox.ToolTip>
-                    </TextBox>
+                    <Grid>
+                        <TextBox x:Name="SearchBox" Height="30" Background="#1a1a1a" Foreground="#aaa" 
+                                 BorderBrush="#2a2a2a" BorderThickness="1" Padding="8,0,24,0" FontSize="11" 
+                                 VerticalContentAlignment="Center" CaretBrush="#666">
+                            <TextBox.ToolTip>
+                                <ToolTip MaxWidth="320" Padding="10,8">
+                                    <StackPanel>
+                                        <TextBlock Text="Search Syntax" FontWeight="SemiBold" Foreground="#aaa" Margin="0,0,0,6"/>
+                                        <TextBlock Text="text" Foreground="#3498db" FontFamily="Consolas"/>
+                                        <TextBlock Text="  Substring match" Foreground="#888" Margin="0,0,0,4"/>
+                                        <TextBlock Text="foo|bar|baz" Foreground="#3498db" FontFamily="Consolas"/>
+                                        <TextBlock Text="  OR search (any term)" Foreground="#888" Margin="0,0,0,4"/>
+                                        <TextBlock Text="/regex pattern/" Foreground="#3498db" FontFamily="Consolas"/>
+                                        <TextBlock Text="  Regular expression" Foreground="#888" Margin="0,0,0,4"/>
+                                        <TextBlock Text="id:abc123" Foreground="#3498db" FontFamily="Consolas"/>
+                                        <TextBlock Text="  Search by ID" Foreground="#888" Margin="0,0,0,4"/>
+                                        <TextBlock Text="ids:abc,def,ghi" Foreground="#3498db" FontFamily="Consolas"/>
+                                        <TextBlock Text="  Multiple IDs (comma-sep)" Foreground="#888" Margin="0,0,0,6"/>
+                                        <TextBlock Text="Exclusions" FontWeight="SemiBold" Foreground="#aaa" Margin="0,0,0,4"/>
+                                        <TextBlock Text="foo not:bar" Foreground="#e74c3c" FontFamily="Consolas"/>
+                                        <TextBlock Text="  Match foo, exclude bar" Foreground="#888" Margin="0,0,0,4"/>
+                                        <TextBlock Text="foo|bar not:baz,qux" Foreground="#e74c3c" FontFamily="Consolas"/>
+                                        <TextBlock Text="  Exclude multiple (comma-sep)" Foreground="#888" Margin="0,0,0,6"/>
+                                        <TextBlock Text="Date filtering:" Foreground="#2ecc71" FontSize="9"/>
+                                        <TextBlock Text="  Use DATE FILTER in sidebar" Foreground="#666" FontSize="9"/>
+                                    </StackPanel>
+                                </ToolTip>
+                            </TextBox.ToolTip>
+                        </TextBox>
+                        <Button x:Name="SearchClearBtn" Content="✕" Width="20" Height="20" 
+                                HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,4,0"
+                                Background="Transparent" BorderThickness="0" Foreground="#555" 
+                                FontSize="10" Cursor="Hand" Visibility="Collapsed">
+                            <Button.Style>
+                                <Style TargetType="Button">
+                                    <Setter Property="Template">
+                                        <Setter.Value>
+                                            <ControlTemplate TargetType="Button">
+                                                <Border x:Name="border" Background="Transparent" CornerRadius="2">
+                                                    <TextBlock Text="✕" Foreground="#555" FontSize="11" 
+                                                               HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                </Border>
+                                                <ControlTemplate.Triggers>
+                                                    <Trigger Property="IsMouseOver" Value="True">
+                                                        <Setter TargetName="border" Property="Background" Value="#333"/>
+                                                    </Trigger>
+                                                </ControlTemplate.Triggers>
+                                            </ControlTemplate>
+                                        </Setter.Value>
+                                    </Setter>
+                                </Style>
+                            </Button.Style>
+                        </Button>
+                    </Grid>
                     
                     <Border Background="#181818" BorderBrush="#252525" BorderThickness="1" Margin="0,8,0,0" Padding="8,6">
                         <Grid>
@@ -2557,7 +2903,48 @@ $script:main_xaml = @'
                     <TextBlock Text="SELECTION" Foreground="#444" FontSize="9" FontWeight="SemiBold" Margin="0,20,0,6"/>
                     <Button x:Name="SelectAllBtn" Content="Select All Visible" Style="{StaticResource SmallSidebarButton}" Margin="0,0,0,4"/>
                     <Button x:Name="DeselectBtn" Content="Clear Selection" Style="{StaticResource SmallSidebarButton}"/>
+                    
+                    <!-- Date Filter Section -->
+                    <TextBlock Text="DATE FILTER" Foreground="#444" FontSize="9" FontWeight="SemiBold" Margin="0,20,0,6"/>
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="50"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="After:" Foreground="#555" FontSize="10" VerticalAlignment="Center"/>
+                        <DatePicker x:Name="DateAfterPicker" Grid.Column="1" Height="26" FontSize="10" 
+                                    Background="#1a1a1a" Foreground="#888" BorderBrush="#333"/>
+                        <TextBlock Text="Before:" Foreground="#555" FontSize="10" VerticalAlignment="Center" Grid.Row="1" Margin="0,4,0,0"/>
+                        <DatePicker x:Name="DateBeforePicker" Grid.Row="1" Grid.Column="1" Height="26" FontSize="10" 
+                                    Background="#1a1a1a" Foreground="#888" BorderBrush="#333" Margin="0,4,0,0"/>
+                        <Button x:Name="ClearDatesBtn" Grid.Row="2" Grid.ColumnSpan="2" Content="Clear Dates" 
+                                Style="{StaticResource SmallSidebarButton}" Margin="0,6,0,0" Height="24"/>
+                    </Grid>
+                    
+                    <!-- Stats Section -->
+                    <TextBlock Text="STATS" Foreground="#444" FontSize="9" FontWeight="SemiBold" Margin="0,20,0,6"/>
+                    <Border Background="#181818" BorderBrush="#252525" BorderThickness="1" Padding="8">
+                        <StackPanel x:Name="StatsPanel">
+                            <TextBlock x:Name="StatsSummary" Text="Load chats to see stats" Foreground="#555" FontSize="10" TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Border>
+                    
+                    <!-- Recently Deleted Section -->
+                    <TextBlock x:Name="RecentlyDeletedLabel" Text="RECENTLY DELETED (0)" Foreground="#444" FontSize="9" FontWeight="SemiBold" Margin="0,20,0,6" Visibility="Collapsed"/>
+                    <Button x:Name="UndoDeleteBtn" Content="↩ Restore to List" Style="{StaticResource SmallSidebarButton}" 
+                            Visibility="Collapsed" Margin="0,0,0,4" ToolTip="Local only - does not restore on server"/>
+                    <Button x:Name="ClearDeletedBtn" Content="Clear Undo History" Style="{StaticResource SmallSidebarButton}" 
+                            Visibility="Collapsed" Foreground="#666"/>
+                    
+                    <!-- Bottom spacer for scroll -->
+                    <Border Height="20"/>
                 </StackPanel>
+                </ScrollViewer>
                 
                 <!-- Chat List -->
                 <Grid Grid.Column="2">
@@ -2734,11 +3121,13 @@ function Start-App
     $script:ui = @{}
     
     $element_names = @(
-        'TitleBar', 'StatusDot', 'StatusTxt', 'MinBtn', 'MaxBtn', 'CloseBtn', 
-        'LoginBtn', 'LoadBtn', 'SearchBox', 'SearchContentChk', 'IndexedTxt', 
-        'IndexBtn', 'TotalTxt', 'ShowingTxt', 'SelectedTxt', 'TotalRow', 
-        'SelectedRow', 'SelectAllBtn', 'DeselectBtn', 'Grid', 'EmptyPanel', 
-        'FooterTxt', 'ExportBtn', 'DeleteBtn', 'ResizeGrip'
+        'TitleBar', 'StatusDot', 'StatusTxt', 'MinBtn', 'MaxBtn', 'CloseBtn', 'HamburgerBtn',
+        'SidebarScroller', 'SidebarPanel', 'LoginBtn', 'LoadBtn', 'SearchBox', 'SearchClearBtn', 'SearchContentChk', 
+        'IndexedTxt', 'IndexBtn', 'TotalTxt', 'ShowingTxt', 'SelectedTxt', 'TotalRow', 
+        'SelectedRow', 'SelectAllBtn', 'DeselectBtn', 
+        'DateAfterPicker', 'DateBeforePicker', 'ClearDatesBtn',
+        'StatsPanel', 'StatsSummary', 'RecentlyDeletedLabel', 'UndoDeleteBtn', 'ClearDeletedBtn',
+        'Grid', 'EmptyPanel', 'FooterTxt', 'ExportBtn', 'DeleteBtn', 'ResizeGrip'
     )
     
     foreach ($name in $element_names)
@@ -2790,27 +3179,290 @@ function Start-App
         }
     })
     
-    # Custom resize for borderless window
-    $script:ui['ResizeGrip'].Add_MouseLeftButtonDown({
-        param($sender, $event_args)
+    # WindowChrome handles resize - just set mode
+    $window.ResizeMode = 'CanResize'
+    
+    #endregion
+    
+    #region Sidebar Toggle
+    
+    # Helper to update hamburger icon appearance
+    $script:update_hamburger_icon = {
+        param([bool]$collapsed)
         
-        # Use Win32 to initiate resize
-        $helper = [System.Windows.Interop.WindowInteropHelper]::new($script:main_window)
-        $source = [System.Windows.Interop.HwndSource]::FromHwnd($helper.Handle)
+        $btn = $script:ui['HamburgerBtn']
+        if (-not $btn) { return }
         
-        # Send resize message (WM_SYSCOMMAND with SC_SIZE + WMSZ_BOTTOMRIGHT)
-        $WM_SYSCOMMAND = 0x0112
-        $SC_SIZE       = 0xF000
-        $WMSZ_BOTTOMRIGHT = 8
+        # Find the template elements
+        $template = $btn.Template
+        if (-not $template) { return }
         
-        [void][System.Windows.Forms.NativeMethods]::ReleaseCapture()
-        $source.HandleRef.Handle | ForEach-Object {
-            # Alternative: just allow normal WPF resize through ResizeMode
+        $hamburger_lines = $template.FindName('HamburgerLines', $btn)
+        $arrow_icon = $template.FindName('ArrowIcon', $btn)
+        
+        if ($hamburger_lines -and $arrow_icon)
+        {
+            if ($collapsed)
+            {
+                # Show arrow, hide hamburger
+                $hamburger_lines.Opacity = 0
+                $arrow_icon.Opacity = 1
+            }
+            else
+            {
+                # Show hamburger, hide arrow
+                $hamburger_lines.Opacity = 1
+                $arrow_icon.Opacity = 0
+            }
+        }
+    }
+    
+    $script:toggle_sidebar = {
+        $sidebar_column = $script:main_window.FindName('SidebarColumn')
+        
+        if ($script:ui_cache.sidebar_collapsed)
+        {
+            # Expand
+            $sidebar_column.Width = [System.Windows.GridLength]::new(180)
+            $script:ui['SidebarScroller'].Visibility = 'Visible'
+            $script:ui_cache.sidebar_collapsed = $false
+            & $script:update_hamburger_icon $false
+        }
+        else
+        {
+            # Collapse
+            $sidebar_column.Width = [System.Windows.GridLength]::new(0)
+            $script:ui['SidebarScroller'].Visibility = 'Collapsed'
+            $script:ui_cache.sidebar_collapsed = $true
+            & $script:update_hamburger_icon $true
+        }
+    }
+    
+    $script:ui['HamburgerBtn'].Add_Click({
+        & $script:toggle_sidebar
+    })
+    
+    # Restore sidebar state after window loads
+    $window.Add_ContentRendered({
+        if ($script:ui_cache.sidebar_collapsed)
+        {
+            $sidebar_column = $script:main_window.FindName('SidebarColumn')
+            $sidebar_column.Width = [System.Windows.GridLength]::new(0)
+            $script:ui['SidebarScroller'].Visibility = 'Collapsed'
+            & $script:update_hamburger_icon $true
         }
     })
     
-    # Set ResizeMode to allow resize
-    $window.ResizeMode = 'CanResizeWithGrip'
+    #endregion
+    
+    #region Search Clear Button
+    
+    $script:ui['SearchBox'].Add_TextChanged({
+        # Show/hide clear button based on text
+        if ($script:ui['SearchBox'].Text.Length -gt 0)
+        {
+            $script:ui['SearchClearBtn'].Visibility = 'Visible'
+        }
+        else
+        {
+            $script:ui['SearchClearBtn'].Visibility = 'Collapsed'
+        }
+        
+        # Trigger debounced search
+        $script:timers.search_debounce.Stop()
+        $script:timers.search_debounce.Start()
+    })
+    
+    $script:ui['SearchClearBtn'].Add_Click({
+        $script:ui['SearchBox'].Text = ""
+        $script:ui['SearchBox'].Focus()
+    })
+    
+    #endregion
+    
+    #region Date Filters
+    
+    $script:apply_date_filter = {
+        # This is called when date pickers change
+        $after_date  = $script:ui['DateAfterPicker'].SelectedDate
+        $before_date = $script:ui['DateBeforePicker'].SelectedDate
+        
+        if (-not $after_date -and -not $before_date)
+        {
+            # No date filter, use text filter only
+            & $script:apply_filter_core
+            return
+        }
+        
+        # Apply combined filter
+        if (-not $script:ui_cache.collection_view)
+        {
+            $script:ui_cache.collection_view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:app_state.all_chats)
+        }
+        
+        $view = $script:ui_cache.collection_view
+        
+        $script:ui_cache.date_after  = $after_date
+        $script:ui_cache.date_before = $before_date
+        
+        # Get search mode for text filter
+        $search_text = $script:ui['SearchBox'].Text.Trim()
+        $search_mode = Get-SearchMode -SearchText $search_text
+        $script:ui_cache.current_search_mode = $search_mode
+        
+        $search_content = $script:ui['SearchContentChk'].IsChecked -eq $true
+        
+        $view.Filter = [Predicate[object]]{
+            param($item)
+            
+            # Check date range first
+            $date_after  = $script:ui_cache.date_after
+            $date_before = $script:ui_cache.date_before
+            
+            if ($date_after -and $item.Updated -lt $date_after)
+            {
+                return $false
+            }
+            
+            if ($date_before -and $item.Updated -gt $date_before)
+            {
+                return $false
+            }
+            
+            # Then check text filter
+            $mode = $script:ui_cache.current_search_mode
+            
+            if ($mode.Mode -eq 'None' -or $mode.Mode -eq 'All')
+            {
+                # Check exclusions only
+                if ($mode.Exclusions -and $mode.Exclusions.Count -gt 0)
+                {
+                    foreach ($exclusion in $mode.Exclusions)
+                    {
+                        if ($item.NameLower.Contains($exclusion)) { return $false }
+                    }
+                }
+                return $true
+            }
+            
+            $search_content_enabled = $script:ui['SearchContentChk'].IsChecked -eq $true
+            
+            $title_match = Test-SearchMatch -Text $item.Name -TextLower $item.NameLower -SearchMode $mode
+            $content_match = $search_content_enabled -and $item.ContentIndexed -and 
+                            (Test-SearchMatch -Text $item.Content -TextLower $item.ContentLower -SearchMode $mode)
+            
+            return ($title_match -or $content_match)
+        }
+        
+        # Count visible
+        $count = 0
+        $enumerator = $view.GetEnumerator()
+        while ($enumerator.MoveNext()) { $count++ }
+        if ($enumerator -is [System.IDisposable]) { $enumerator.Dispose() }
+        
+        $script:ui['ShowingTxt'].Text = $count
+        $script:ui['FooterTxt'].Text  = "Showing $count (date filtered)"
+    }
+    
+    if ($script:ui['DateAfterPicker'])
+    {
+        $script:ui['DateAfterPicker'].Add_SelectedDateChanged({
+            & $script:apply_date_filter
+        })
+    }
+    
+    if ($script:ui['DateBeforePicker'])
+    {
+        $script:ui['DateBeforePicker'].Add_SelectedDateChanged({
+            & $script:apply_date_filter
+        })
+    }
+    
+    if ($script:ui['ClearDatesBtn'])
+    {
+        $script:ui['ClearDatesBtn'].Add_Click({
+            $script:ui['DateAfterPicker'].SelectedDate  = $null
+            $script:ui['DateBeforePicker'].SelectedDate = $null
+            $script:ui_cache.date_after  = $null
+            $script:ui_cache.date_before = $null
+            & $script:apply_filter_core
+        })
+    }
+    
+    #endregion
+    
+    #region Undo Delete Functionality
+    
+    if ($script:ui['UndoDeleteBtn'])
+    {
+        $script:ui['UndoDeleteBtn'].Add_Click({
+            if ($script:app_state.deleted_buffer.Count -eq 0)
+            {
+                $script:ui['FooterTxt'].Text = "Nothing to restore"
+                return
+            }
+            
+            # Restore items
+            foreach ($item in $script:app_state.deleted_buffer)
+            {
+                $script:app_state.all_chats.Add($item)
+            }
+            
+            $restored_count = $script:app_state.deleted_buffer.Count
+            $script:app_state.deleted_buffer = @()
+            
+            Update-DeletedBufferUI
+            Update-StatsDisplay
+            
+            $script:ui['FooterTxt'].Text = "Restored $restored_count to local list (server deletion is permanent)"
+        })
+    }
+    
+    if ($script:ui['ClearDeletedBtn'])
+    {
+        $script:ui['ClearDeletedBtn'].Add_Click({
+            $script:app_state.deleted_buffer = @()
+            Update-DeletedBufferUI
+            $script:ui['FooterTxt'].Text = "Undo history cleared"
+        })
+    }
+    
+    #endregion
+    
+    #region Window State Persistence
+    
+    # Restore window state on load
+    Restore-WindowState -Window $window
+    
+    # Save window state on close and confirm if selections
+    $window.Add_Closing({
+        param($sender, $event_args)
+        
+        # Check for selections
+        $selected_count = 0
+        if ($script:app_state.all_chats)
+        {
+            foreach ($chat in $script:app_state.all_chats)
+            {
+                if ($chat.Selected) { $selected_count++ }
+            }
+        }
+        
+        if ($selected_count -gt 0)
+        {
+            $result = [System.Windows.MessageBox]::Show(
+                "You have $selected_count conversation(s) selected.`n`nClose anyway?",
+                "Confirm Close", 'YesNo', 'Question')
+            
+            if ($result -ne 'Yes')
+            {
+                $event_args.Cancel = $true
+                return
+            }
+        }
+        
+        Save-WindowState -Window $script:main_window
+    })
     
     #endregion
     
@@ -2819,6 +3471,9 @@ function Start-App
     $window.Add_PreviewKeyDown({
         param($sender, $event_args)
         
+        # Skip if search box has focus (except Escape)
+        $search_focused = $script:ui['SearchBox'].IsFocused
+        
         # Ctrl+F - Focus search
         if ($event_args.Key -eq 'F' -and $event_args.KeyboardDevice.Modifiers -eq 'Control')
         {
@@ -2826,15 +3481,26 @@ function Start-App
             $script:ui['SearchBox'].SelectAll()
             $event_args.Handled = $true
         }
-        # Escape - Clear search if focused
-        elseif ($event_args.Key -eq 'Escape' -and $script:ui['SearchBox'].IsFocused)
+        # Escape - Clear search if focused, or deselect all
+        elseif ($event_args.Key -eq 'Escape')
         {
-            $script:ui['SearchBox'].Text = ""
-            $script:ui['Grid'].Focus()
+            if ($search_focused)
+            {
+                $script:ui['SearchBox'].Text = ""
+                $script:ui['Grid'].Focus()
+            }
+            else
+            {
+                # Deselect all
+                foreach ($chat in $script:app_state.all_chats)
+                {
+                    $chat.Selected = $false
+                }
+            }
             $event_args.Handled = $true
         }
         # Delete - Delete selected chats
-        elseif ($event_args.Key -eq 'Delete' -and -not $script:ui['SearchBox'].IsFocused)
+        elseif ($event_args.Key -eq 'Delete' -and -not $search_focused)
         {
             if ($script:ui['DeleteBtn'].IsEnabled)
             {
@@ -2845,11 +3511,90 @@ function Start-App
             $event_args.Handled = $true
         }
         # Ctrl+A - Select all visible
-        elseif ($event_args.Key -eq 'A' -and $event_args.KeyboardDevice.Modifiers -eq 'Control' -and -not $script:ui['SearchBox'].IsFocused)
+        elseif ($event_args.Key -eq 'A' -and $event_args.KeyboardDevice.Modifiers -eq 'Control' -and -not $search_focused)
         {
             $script:ui['SelectAllBtn'].RaiseEvent(
                 [System.Windows.RoutedEventArgs]::new(
                     [System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+            $event_args.Handled = $true
+        }
+        # Spacebar - Toggle selection of current row
+        elseif ($event_args.Key -eq 'Space' -and -not $search_focused)
+        {
+            $selected_item = $script:ui['Grid'].SelectedItem
+            if ($selected_item)
+            {
+                $selected_item.Selected = -not $selected_item.Selected
+            }
+            $event_args.Handled = $true
+        }
+        # Arrow keys - Navigate and optionally select
+        elseif (($event_args.Key -eq 'Up' -or $event_args.Key -eq 'Down') -and -not $search_focused)
+        {
+            $grid = $script:ui['Grid']
+            $current_index = $grid.SelectedIndex
+            $is_shift = $event_args.KeyboardDevice.Modifiers -band [System.Windows.Input.ModifierKeys]::Shift
+            
+            $new_index = if ($event_args.Key -eq 'Up') 
+            { 
+                [Math]::Max(0, $current_index - 1) 
+            } 
+            else 
+            { 
+                [Math]::Min($grid.Items.Count - 1, $current_index + 1) 
+            }
+            
+            if ($new_index -ne $current_index)
+            {
+                # If shift is held, select the item we're leaving
+                if ($is_shift -and $current_index -ge 0)
+                {
+                    $current_item = $grid.Items[$current_index]
+                    if ($current_item) { $current_item.Selected = $true }
+                }
+                
+                $grid.SelectedIndex = $new_index
+                $grid.ScrollIntoView($grid.SelectedItem)
+                
+                # If shift is held, also select the new item
+                if ($is_shift)
+                {
+                    $new_item = $grid.Items[$new_index]
+                    if ($new_item) { $new_item.Selected = $true }
+                }
+            }
+            
+            $event_args.Handled = $true
+        }
+        # Home - Go to first item
+        elseif ($event_args.Key -eq 'Home' -and -not $search_focused)
+        {
+            $script:ui['Grid'].SelectedIndex = 0
+            $script:ui['Grid'].ScrollIntoView($script:ui['Grid'].SelectedItem)
+            $event_args.Handled = $true
+        }
+        # End - Go to last item
+        elseif ($event_args.Key -eq 'End' -and -not $search_focused)
+        {
+            $script:ui['Grid'].SelectedIndex = $script:ui['Grid'].Items.Count - 1
+            $script:ui['Grid'].ScrollIntoView($script:ui['Grid'].SelectedItem)
+            $event_args.Handled = $true
+        }
+        # Ctrl+Z - Undo delete
+        elseif ($event_args.Key -eq 'Z' -and $event_args.KeyboardDevice.Modifiers -eq 'Control')
+        {
+            if ($script:ui['UndoDeleteBtn'].Visibility -eq 'Visible')
+            {
+                $script:ui['UndoDeleteBtn'].RaiseEvent(
+                    [System.Windows.RoutedEventArgs]::new(
+                        [System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+            }
+            $event_args.Handled = $true
+        }
+        # Ctrl+B - Toggle sidebar
+        elseif ($event_args.Key -eq 'B' -and $event_args.KeyboardDevice.Modifiers -eq 'Control')
+        {
+            & $script:toggle_sidebar
             $event_args.Handled = $true
         }
     })
@@ -2922,6 +3667,13 @@ function Start-App
         {
             $script:ui['SelectedTxt'].Text = $count
             $script:_last_selection_count  = $count
+            
+            # Update footer with selection info
+            if ($count -gt 0)
+            {
+                $visible = $script:ui['ShowingTxt'].Text
+                $script:ui['FooterTxt'].Text = "Selected: $count of $visible visible"
+            }
         }
     })
     
@@ -3340,11 +4092,6 @@ function Start-App
         & $script:apply_filter_core
     })
     
-    $script:ui['SearchBox'].Add_TextChanged({
-        $script:timers.search_debounce.Stop()
-        $script:timers.search_debounce.Start()
-    })
-    
     $script:ui['SearchContentChk'].Add_Click({
         & $script:apply_filter_core
     })
@@ -3620,6 +4367,9 @@ function Start-App
         
         Update-ButtonState -Button $script:ui['LoadBtn'] -Text "Refresh Chats" -Enabled $true
         
+        # Update stats display
+        Update-StatsDisplay
+        
         Write-Host "=== Loaded $count chats ===" -ForegroundColor Magenta
     })
     
@@ -3708,19 +4458,42 @@ function Start-App
     #region Export Button
     
     $script:ui['ExportBtn'].Add_Click({
-        $to_export = @($script:app_state.all_chats | Where-Object { $_.Selected })
-        $export_all = $false
+        $selected = @($script:app_state.all_chats | Where-Object { $_.Selected })
+        $all_chats = @($script:app_state.all_chats)
         
-        if ($to_export.Count -eq 0)
-        {
-            $to_export  = @($script:app_state.all_chats)
-            $export_all = $true
-        }
-        
-        if ($to_export.Count -eq 0)
+        if ($all_chats.Count -eq 0)
         {
             [System.Windows.MessageBox]::Show("No conversations to export.", "Export", 'OK', 'Information')
             return
+        }
+        
+        # If there are selections, ask what to export
+        $to_export = $null
+        $export_label = ""
+        
+        if ($selected.Count -gt 0 -and $selected.Count -lt $all_chats.Count)
+        {
+            $choice = [System.Windows.MessageBox]::Show(
+                "Export selected ($($selected.Count)) or all ($($all_chats.Count)) conversations?`n`nYes = Selected only`nNo = All conversations",
+                "Export Scope", 'YesNoCancel', 'Question')
+            
+            if ($choice -eq 'Cancel') { return }
+            
+            if ($choice -eq 'Yes')
+            {
+                $to_export = $selected
+                $export_label = "Selected"
+            }
+            else
+            {
+                $to_export = $all_chats
+                $export_label = "All"
+            }
+        }
+        else
+        {
+            $to_export = $all_chats
+            $export_label = "All"
         }
         
         $export_type = [System.Windows.MessageBox]::Show(
@@ -3734,7 +4507,7 @@ function Start-App
         $dialog = [Microsoft.Win32.SaveFileDialog]::new()
         $dialog.Filter   = "JSON|*.json"
         $dialog.FileName = "claude_export_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-        $dialog.Title    = if ($export_all) { "Export All ($($to_export.Count))" } else { "Export Selected ($($to_export.Count))" }
+        $dialog.Title    = "Export $export_label ($($to_export.Count))"
         
         if (-not $dialog.ShowDialog()) { return }
         
@@ -3800,18 +4573,35 @@ function Start-App
         }
         
         $confirm = [System.Windows.MessageBox]::Show(
-            "Permanently delete $($to_delete.Count) conversation(s)?`n`nThis cannot be undone!",
+            "Permanently delete $($to_delete.Count) conversation(s)?`n`nThis cannot be undone on the server!",
             "Confirm Delete", 'YesNo', 'Warning')
         
         if ($confirm -ne 'Yes') { return }
+        
+        # Save copies of items for undo (local view only - server deletion is permanent)
+        $script:app_state.deleted_buffer = @()
+        foreach ($item in $to_delete)
+        {
+            $copy = [ChatItem]::new()
+            $copy.Id             = $item.Id
+            $copy.Name           = $item.Name
+            $copy.Updated        = $item.Updated
+            $copy.Selected       = $false
+            $copy.Content        = $item.Content
+            $copy.ContentIndexed = $item.ContentIndexed
+            $script:app_state.deleted_buffer += $copy
+        }
         
         Update-ButtonState -Button $script:ui['DeleteBtn'] -Text "Deleting..." -Enabled $false
         
         $deleted = Remove-SelectedChats -Chats $to_delete -Owner $script:main_window
         
-        $script:ui['FooterTxt'].Text = "Deleted $deleted conversation(s)"
+        $script:ui['FooterTxt'].Text = "Deleted $deleted conversation(s) permanently"
         
         Update-ButtonState -Button $script:ui['DeleteBtn'] -Text "Delete Selected" -Enabled $true
+        
+        Update-DeletedBufferUI
+        Update-StatsDisplay
     })
     
     #endregion
